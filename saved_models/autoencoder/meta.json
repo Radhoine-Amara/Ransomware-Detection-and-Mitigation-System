@@ -71,7 +71,7 @@
     "feat_callback_density"
   ],
   "n_features": 69,
-  "threshold": 2.069864463480976,
+  "threshold": 1.9815721514366733,
   "encoder_dims": [
     128,
     64,
