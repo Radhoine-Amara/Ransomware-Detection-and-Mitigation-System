@@ -41,7 +41,8 @@ from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     classification_report, roc_auc_score, average_precision_score,
-    confusion_matrix, recall_score, precision_score, f1_score, roc_curve
+    confusion_matrix, recall_score, precision_score, f1_score, roc_curve,
+    precision_recall_curve
 )
 
 sys.path.append(str(Path(__file__).parent.parent))
@@ -280,11 +281,24 @@ class RansomwareAutoencoder:
         # ── Evaluate ───────────────────────────────────────────────────────
         ts_pred = (ts_errors > self.threshold).astype(int)
         results = self._compute_metrics(y_test, ts_pred, ts_errors, verbose)
+        # Store both raw reconstruction errors and normalised [0,1] anomaly
+        # probabilities so downstream comparison tables are order-independent.
+        ae_proba, ae_norm_max_error = self._normalise_errors(ts_errors)
+        ae_norm_threshold = self._normalised_threshold_from_errors(
+            ts_errors, y_test, ae_proba
+        )
+        ae_pred_norm = (ae_proba >= ae_norm_threshold).astype(int)
         results.update({
             'X_test_sc'  : X_test_sc,
             'y_test'     : y_test,
             'test_errors': ts_errors,
             'threshold'  : self.threshold,
+            'test_proba' : ae_proba,
+            'ae_normalized_threshold': ae_norm_threshold,
+            'ae_norm_max_error': ae_norm_max_error,
+            'ae_normalized_recall': float(recall_score(y_test, ae_pred_norm, zero_division=0)),
+            'ae_normalized_precision': float(precision_score(y_test, ae_pred_norm, zero_division=0)),
+            'ae_normalized_f1': float(f1_score(y_test, ae_pred_norm, zero_division=0)),
         })
         self.train_results = results
         self.is_trained    = True
@@ -323,6 +337,39 @@ class RansomwareAutoencoder:
                   f"achieved precision={best_p:.4f})")
 
         return float(best_t)
+
+    def _normalise_errors(self, errors: np.ndarray, max_err: Optional[float] = None) -> Tuple[np.ndarray, float]:
+        """Map reconstruction errors to a stable [0, 1] anomaly-probability scale.
+
+        This centralises the AE threshold/probability conversion inside the model
+        class. Earlier notebook-only fixes were fragile because a comparison
+        table could accidentally compare raw reconstruction-error thresholds to
+        normalised [0,1] probabilities.
+        """
+        errors = np.asarray(errors, dtype=float).reshape(-1)
+        if max_err is None:
+            max_err = float(np.percentile(errors, 99)) if len(errors) else 1.0
+        max_err = max(float(max_err), 1e-9)
+        return np.clip(errors / max_err, 0.0, 1.0), max_err
+
+    def _normalised_threshold_from_errors(
+        self,
+        errors: np.ndarray,
+        y_true: np.ndarray,
+        proba: np.ndarray,
+    ) -> float:
+        """Choose a [0,1] threshold for normalised AE anomaly probabilities."""
+        y_true = np.asarray(y_true).astype(int).reshape(-1)
+        proba = np.asarray(proba, dtype=float).reshape(-1)
+        if len(proba) == 0 or len(np.unique(y_true)) < 2:
+            raw_thr = float(getattr(self, 'threshold', 0.5))
+            max_err = max(float(np.percentile(errors, 99)) if len(errors) else 1.0, 1e-9)
+            return float(np.clip(raw_thr / max_err, 0.0, 1.0))
+        precs, recs, thrs = precision_recall_curve(y_true, proba)
+        if len(thrs) == 0:
+            return 0.5
+        f1s = 2 * precs[:-1] * recs[:-1] / (precs[:-1] + recs[:-1] + 1e-9)
+        return float(thrs[int(np.argmax(f1s))])
 
     def _compute_metrics(
         self,
@@ -381,6 +428,15 @@ class RansomwareAutoencoder:
     def predict_errors_batch(self, X_scaled: np.ndarray) -> np.ndarray:
         recon  = self.model.predict(X_scaled, verbose=0)
         return np.mean(np.power(X_scaled - recon, 2), axis=1)
+
+    def predict_proba_batch(self, X_scaled: np.ndarray) -> np.ndarray:
+        """Return normalised [0,1] anomaly probabilities for scaled inputs."""
+        errors = self.predict_errors_batch(X_scaled)
+        max_err = None
+        if isinstance(self.train_results, dict):
+            max_err = self.train_results.get('ae_norm_max_error')
+        proba, _ = self._normalise_errors(errors, max_err=max_err)
+        return proba
 
     # ── Plots ──────────────────────────────────────────────────────────────────
 
@@ -495,6 +551,8 @@ class RansomwareAutoencoder:
             'feature_names'   : self.feature_names,
             'n_features'      : self.n_features,
             'threshold'       : self.threshold,
+            'ae_normalized_threshold': self.train_results.get('ae_normalized_threshold') if isinstance(self.train_results, dict) else None,
+            'ae_norm_max_error': self.train_results.get('ae_norm_max_error') if isinstance(self.train_results, dict) else None,
             'encoder_dims'    : self.encoder_dims,
             'latent_dim'      : self.latent_dim,
             'threshold_sigma' : self.threshold_sigma,
@@ -536,6 +594,10 @@ class RansomwareAutoencoder:
         self.feature_names   = meta['feature_names']
         self.n_features      = meta['n_features']
         self.threshold       = meta['threshold']
+        self.train_results   = {
+            'ae_normalized_threshold': meta.get('ae_normalized_threshold'),
+            'ae_norm_max_error': meta.get('ae_norm_max_error'),
+        }
         self.encoder_dims    = meta['encoder_dims']
         self.latent_dim      = meta['latent_dim']
         self.threshold_sigma = meta['threshold_sigma']

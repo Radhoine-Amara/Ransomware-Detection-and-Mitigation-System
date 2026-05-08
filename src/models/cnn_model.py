@@ -1,6 +1,6 @@
 # src/models/cnn_model.py
 # =============================================================================
-# Layer 2 — RansomwareCNN
+# Layer 2 — RansomwareCNN v8
 # 1D-CNN behavioral ransomware detector trained on sliding-window telemetry.
 # =============================================================================
 
@@ -9,6 +9,7 @@ import json
 import math
 import numpy as np
 import joblib
+import warnings
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -19,6 +20,8 @@ from sklearn.metrics import (
     confusion_matrix,
     precision_recall_curve, roc_curve,
 )
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
 
 _tf = None
 
@@ -62,6 +65,12 @@ class RansomwareCNN:
         l2_reg:        float = 1e-4,
         recall_target: float = 0.85,
         threshold_floor: float = 0.35,
+        calibration_method: str = "platt",
+        strict_fpr_target: float = 0.20,
+        balanced_fpr_target: float = 0.35,
+        sensitive_min_threshold: float = 0.05,
+        balanced_min_threshold: float = 0.12,
+        strict_min_threshold: float = 0.20,
         epochs:        int   = 80,
         batch_size:    int   = 64,
         random_state:  int   = 42,
@@ -75,6 +84,12 @@ class RansomwareCNN:
         self.l2_reg          = l2_reg
         self.recall_target   = recall_target
         self.threshold_floor = threshold_floor
+        self.calibration_method = calibration_method
+        self.strict_fpr_target = strict_fpr_target
+        self.balanced_fpr_target = balanced_fpr_target
+        self.sensitive_min_threshold = float(sensitive_min_threshold)
+        self.balanced_min_threshold = float(balanced_min_threshold)
+        self.strict_min_threshold = float(strict_min_threshold)
         self.epochs          = epochs
         self.batch_size      = batch_size
         self.random_state    = random_state
@@ -82,6 +97,8 @@ class RansomwareCNN:
         self.model        = None
         self.scaler       = None
         self.threshold    = 0.5
+        self.threshold_modes = {}
+        self.calibrator = None
         self.feature_cols = None
         self._history     = None
         self._y_test      = None
@@ -187,11 +204,16 @@ class RansomwareCNN:
         if ckpt_path and os.path.exists(ckpt_path):
             self.model = keras.models.load_model(ckpt_path)
 
-        # Threshold tuning on validation set
-        self.threshold = self._tune_threshold(X_va, y_va)
+        # Validation probabilities, optional calibration, and V8 threshold modes.
+        raw_val_prob = self.model.predict(X_va, verbose=0).squeeze()
+        self._fit_calibrator(raw_val_prob, y_va)
+        val_prob = self._apply_calibration(raw_val_prob)
+        self.threshold_modes = self._build_threshold_modes(val_prob, y_va)
+        self.threshold = float(self.threshold_modes.get("balanced", {}).get("threshold", self._tune_threshold_from_probs(val_prob, y_va)))
 
-        # Test evaluation
-        y_prob = self.model.predict(X_te, verbose=0).squeeze()
+        # Test evaluation with the same calibration used for validation tuning.
+        raw_test_prob = self.model.predict(X_te, verbose=0).squeeze()
+        y_prob = self._apply_calibration(raw_test_prob)
         y_pred = (y_prob >= self.threshold).astype(int)
 
         rec  = recall_score(y_te, y_pred, zero_division=0)
@@ -226,85 +248,223 @@ class RansomwareCNN:
             "balanced_accuracy":round(float(bal_acc), 4),
             "miss_rate":        round(float(1-rec), 4),
             "threshold":        round(self.threshold, 6),
+            "threshold_modes":  self.threshold_modes,
+            "calibration_method": self.calibration_method,
             "confusion_matrix": cm.tolist(),
             "y_test":           y_te,
             "test_proba":       y_prob,
             "history":          self._history,
         }
 
-    # ── Threshold tuning ──────────────────────────────────────────────────────
+    # ── Threshold tuning and calibration ───────────────────────────────────────
+    def _fit_calibrator(self, val_prob: np.ndarray, y_val: np.ndarray):
+        """Fit an optional probability calibrator on validation probabilities.
+
+        Calibration is intentionally one-dimensional: the CNN already produces a
+        probability-like score, and the calibrator only reshapes that score so a
+        benign window is less likely to sit near the alert threshold. If fitting
+        fails, the model safely falls back to raw CNN probabilities.
+        """
+        method = (self.calibration_method or "none").lower()
+        self.calibrator = None
+        val_prob = np.asarray(val_prob, dtype=float).reshape(-1)
+        y_val = np.asarray(y_val).astype(int).reshape(-1)
+        if method in ("none", "off", "false") or len(np.unique(y_val)) < 2:
+            return
+        try:
+            if method == "platt":
+                lr = LogisticRegression(solver="lbfgs", max_iter=1000)
+                lr.fit(val_prob.reshape(-1, 1), y_val)
+                self.calibrator = lr
+            elif method == "isotonic":
+                iso = IsotonicRegression(out_of_bounds="clip")
+                iso.fit(val_prob, y_val)
+                self.calibrator = iso
+            else:
+                warnings.warn(f"Unknown calibration_method={method!r}; using raw probabilities.")
+                self.calibration_method = "none"
+                return
+            print(f"  [Calibration] fitted {method} calibrator on validation scores")
+        except Exception as e:
+            warnings.warn(f"CNN calibration skipped: {e}")
+            self.calibrator = None
+            self.calibration_method = "none"
+
+    def _apply_calibration(self, proba: np.ndarray) -> np.ndarray:
+        proba = np.asarray(proba, dtype=float).reshape(-1)
+        if self.calibrator is None:
+            return proba
+        if isinstance(self.calibrator, LogisticRegression):
+            return self.calibrator.predict_proba(proba.reshape(-1, 1))[:, 1]
+        # IsotonicRegression exposes predict().
+        return np.asarray(self.calibrator.predict(proba), dtype=float).reshape(-1)
+
+    def _threshold_metrics(self, y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> dict:
+        pred = (y_prob >= threshold).astype(int)
+        cm = confusion_matrix(y_true, pred, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+        return {
+            "threshold": float(threshold),
+            "recall": float(recall_score(y_true, pred, zero_division=0)),
+            "precision": float(precision_score(y_true, pred, zero_division=0)),
+            "f1": float(f1_score(y_true, pred, zero_division=0)),
+            "fpr": float(fp / max(fp + tn, 1)),
+            "specificity": float(tn / max(tn + fp, 1)),
+        }
+
+    def _build_threshold_modes(self, val_prob: np.ndarray, y_val: np.ndarray) -> dict:
+        """Create genuinely distinct sensitive/balanced/strict operating points.
+
+        V8.1 fixes the previous issue where Platt-calibrated probabilities could
+        make sensitive, balanced, and strict thresholds nearly identical. Each
+        mode now has a minimum operating threshold and an explicit selection goal:
+
+          • sensitive: high recall, used only when Layer 1 is HIGH/CRITICAL.
+          • balanced : default training/evaluation threshold.
+          • strict   : lower-FPR mode for SAFE/WATCH contexts and hard-benign tests.
+
+        The final EDR still uses the orchestrator evidence gate, so window-level
+        threshold tuning should reduce noise without creating hard-kill risk.
+        """
+        y_val = np.asarray(y_val).astype(int)
+        val_prob = np.asarray(val_prob, dtype=float).reshape(-1)
+        if len(np.unique(y_val)) < 2:
+            return {"balanced": self._threshold_metrics(y_val, val_prob, 0.5)}
+
+        precs, recs, thrs_pr = precision_recall_curve(y_val, val_prob)
+        candidates = set(float(t) for t in thrs_pr)
+        candidates.update(np.linspace(0.001, 0.999, 999))
+        candidates = sorted(t for t in candidates if 0.0 < t < 1.0)
+        rows_all = [self._threshold_metrics(y_val, val_prob, t) for t in candidates]
+
+        mode_floors = {
+            "sensitive": max(0.001, float(self.sensitive_min_threshold), float(self.threshold_floor)),
+            "balanced": max(0.001, float(self.balanced_min_threshold), float(self.threshold_floor)),
+            "strict": max(0.001, float(self.strict_min_threshold), float(self.threshold_floor)),
+        }
+
+        def rows_for(mode):
+            floor = mode_floors[mode]
+            r = [x for x in rows_all if x["threshold"] >= floor]
+            return r or rows_all
+
+        def best_where(rows, predicate, key):
+            valid = [r for r in rows if predicate(r)]
+            if not valid:
+                return None
+            return max(valid, key=key)
+
+        sens_rows = rows_for("sensitive")
+        bal_rows = rows_for("balanced")
+        strict_rows = rows_for("strict")
+
+        # Sensitive: recall-first, but keep the best precision among valid choices.
+        sensitive = best_where(
+            sens_rows,
+            lambda r: r["recall"] >= self.recall_target,
+            lambda r: (r["precision"], r["f1"], -r["fpr"], r["threshold"]),
+        )
+        if sensitive is None:
+            sensitive = max(sens_rows, key=lambda r: (r["recall"], r["f1"], r["precision"]))
+
+        # Balanced: the default score. Prefer recall >= target-5%, but constrain FPR.
+        balanced = best_where(
+            bal_rows,
+            lambda r: r["recall"] >= max(0.80, self.recall_target - 0.05) and r["fpr"] <= self.balanced_fpr_target,
+            lambda r: (r["f1"], r["precision"], r["recall"], -r["fpr"]),
+        )
+        if balanced is None:
+            balanced = best_where(
+                bal_rows,
+                lambda r: r["recall"] >= max(0.75, self.recall_target - 0.10),
+                lambda r: (r["f1"], -r["fpr"], r["precision"], r["recall"]),
+            ) or max(bal_rows, key=lambda r: (r["f1"], -r["fpr"], r["recall"]))
+
+        # Strict: lower-FPR mode. Keep useful recall, but make FPR the priority.
+        strict = best_where(
+            strict_rows,
+            lambda r: r["fpr"] <= self.strict_fpr_target and r["recall"] >= 0.50,
+            lambda r: (r["f1"], r["precision"], r["recall"], -r["fpr"]),
+        )
+        if strict is None:
+            strict = min(strict_rows, key=lambda r: (abs(r["fpr"] - self.strict_fpr_target), -r["recall"], -r["precision"]))
+
+        modes = {"sensitive": sensitive, "balanced": balanced, "strict": strict}
+
+        # Ensure interpretability: sensitive <= balanced <= strict when possible.
+        # If validation data is pathological, keep metrics but mark the issue.
+        order_ok = modes["sensitive"]["threshold"] <= modes["balanced"]["threshold"] <= modes["strict"]["threshold"]
+        for name, r in modes.items():
+            r["mode_floor"] = float(mode_floors[name])
+            r["order_ok"] = bool(order_ok)
+
+        print("  [Threshold modes — validation]")
+        for name, r in modes.items():
+            print(f"    {name:<9}: thr={r['threshold']:.4f} floor={r['mode_floor']:.3f} "
+                  f"recall={r['recall']:.3f} precision={r['precision']:.3f} "
+                  f"fpr={r['fpr']:.3f} f1={r['f1']:.3f}")
+        if not order_ok:
+            print("    ⚠ threshold order is not monotonic; validation distribution is unusual.")
+        return modes
+
+    def probability_diagnostics(self, y_true: np.ndarray = None, y_prob: np.ndarray = None) -> dict:
+        """Return compact calibrated-score diagnostics for notebook/reporting."""
+        if y_true is None:
+            y_true = self._y_test
+        if y_prob is None:
+            y_prob = self._y_prob_test
+        if y_true is None or y_prob is None:
+            return {}
+        y_true = np.asarray(y_true).astype(int)
+        y_prob = np.asarray(y_prob, dtype=float).reshape(-1)
+        out = {}
+        for label, name in [(0, "benign"), (1, "ransomware")]:
+            vals = y_prob[y_true == label]
+            if len(vals):
+                out[name] = {
+                    "count": int(len(vals)),
+                    "mean": float(np.mean(vals)),
+                    "median": float(np.median(vals)),
+                    "p90": float(np.quantile(vals, 0.90)),
+                    "p95": float(np.quantile(vals, 0.95)),
+                    "max": float(np.max(vals)),
+                }
+        return out
+
+    def _tune_threshold_from_probs(self, y_prob: np.ndarray, y_val: np.ndarray) -> float:
+        modes = self._build_threshold_modes(y_prob, y_val)
+        return float(modes.get("balanced", {}).get("threshold", 0.5))
+
     def _tune_threshold(self, X_val: np.ndarray, y_val: np.ndarray) -> float:
-        """
-        Precision-recall curve sweep targeting recall >= recall_target.
-
-        Why PR-curve instead of Youden-J:
-            Youden-J (TPR-FPR) maximises balanced accuracy across all thresholds
-            and landed at 0.836 — far too high, giving only 61% test recall.
-            The issue: Youden-J does not know we care more about missing
-            ransomware than flagging benign. The PR-curve sweep directly finds
-            the lowest threshold that meets the recall target.
-
-        Logic:
-            1. Sweep PR curve. Find all thresholds where recall >= recall_target.
-            2. Among those, pick the one with the highest precision (best F1).
-            3. If no threshold meets recall_target, pick threshold at recall_target*0.9.
-            4. Apply a configurable floor only to prevent unsafe near-zero thresholds.
-        """
-        y_prob = self.model.predict(X_val, verbose=0).squeeze()
-
-        precs, recs, thrs = precision_recall_curve(y_val, y_prob)
-        # Note: precision_recall_curve returns arrays of len n+1; thrs has len n
-        precs_t = precs[:-1]
-        recs_t  = recs[:-1]
-
-        # Find candidates meeting recall target
-        candidates = [
-            (float(t), float(p), float(r),
-             2 * float(p) * float(r) / (float(p) + float(r) + 1e-9))
-            for t, p, r in zip(thrs, precs_t, recs_t)
-            if r >= self.recall_target
-        ]
-
-        if candidates:
-            # Among candidates, pick highest F1 (best precision-recall balance)
-            best = max(candidates, key=lambda x: x[3])
-            chosen = max(float(best[0]), self.threshold_floor)
-            print(f"  [Threshold] PR-curve: {chosen:.4f}  "
-                  f"recall={best[2]:.3f}  precision={best[1]:.3f}  F1={best[3]:.3f}")
-            return chosen
-
-        # Fallback: recall target unachievable — use 90% of target
-        relaxed = self.recall_target * 0.90
-        candidates_relaxed = [
-            (float(t), float(p), float(r),
-             2 * float(p) * float(r) / (float(p) + float(r) + 1e-9))
-            for t, p, r in zip(thrs, precs_t, recs_t)
-            if r >= relaxed
-        ]
-        if candidates_relaxed:
-            best = max(candidates_relaxed, key=lambda x: x[3])
-            chosen = max(float(best[0]), self.threshold_floor)
-            print(f"  [Threshold] Recall {self.recall_target:.0%} unachievable. "
-                  f"Relaxed to {relaxed:.0%}: threshold={chosen:.4f}  "
-                  f"recall={best[2]:.3f}  precision={best[1]:.3f}")
-            return chosen
-
-        # Last resort: max F1
-        f1s = 2 * precs_t * recs_t / (precs_t + recs_t + 1e-9)
-        chosen = max(float(thrs[np.argmax(f1s)]), self.threshold_floor)
-        print(f"  [Threshold] Fallback max-F1: {chosen:.4f}")
-        return chosen
+        """Backwards-compatible API: tune a balanced threshold from validation X."""
+        raw = self.model.predict(X_val, verbose=0).squeeze()
+        self._fit_calibrator(raw, y_val)
+        prob = self._apply_calibration(raw)
+        self.threshold_modes = self._build_threshold_modes(prob, y_val)
+        return float(self.threshold_modes.get("balanced", {}).get("threshold", 0.5))
 
     # ── Predict → SystemEvent ─────────────────────────────────────────────────
+    def predict_proba_windows(self, X_scaled: np.ndarray) -> np.ndarray:
+        """Predict probabilities for already-scaled CNN windows."""
+        raw = self.model.predict(X_scaled, verbose=0).squeeze()
+        return self._apply_calibration(raw)
+
+    def predict_proba_raw_window(self, window_raw: np.ndarray, scaler=None) -> float:
+        """Predict one raw unscaled telemetry window using the attached scaler."""
+        if scaler is None:
+            scaler = self.scaler
+        if scaler is None:
+            raise ValueError("CNN scaler is required for raw-window inference.")
+        scaled = scaler.transform(window_raw)
+        return float(self.predict_proba_windows(scaled[np.newaxis, ...])[0])
+
     def predict(self, window_array: np.ndarray,
                 pid: int = 0, process_name: str = "unknown"):
         from src.engine.system_event import (
             SystemEvent, SEVERITY_HIGH, SEVERITY_NONE,
-            ACTION_KILL_PROCESS, ACTION_SEND_ALERT,
-            ACTION_LOG_EVENT, ACTION_NO_ACTION,
+            ACTION_SEND_ALERT, ACTION_LOG_EVENT,
         )
-        prob  = float(self.model.predict(
-            window_array[np.newaxis, ...], verbose=0)[0, 0])
+        prob = float(self.predict_proba_windows(window_array[np.newaxis, ...])[0])
         alert = prob >= self.threshold
         return SystemEvent(
             alert               = alert,
@@ -331,6 +491,13 @@ class RansomwareCNN:
             "window_size":    self.window_size,
             "n_features":     self.n_features,
             "threshold":      self.threshold,
+            "threshold_modes": self.threshold_modes,
+            "calibration_method": self.calibration_method,
+            "strict_fpr_target": self.strict_fpr_target,
+            "balanced_fpr_target": self.balanced_fpr_target,
+            "sensitive_min_threshold": self.sensitive_min_threshold,
+            "balanced_min_threshold": self.balanced_min_threshold,
+            "strict_min_threshold": self.strict_min_threshold,
             "filters_1":      self.filters_1,
             "filters_2":      self.filters_2,
             "dropout_rate":   self.dropout_rate,
@@ -341,6 +508,8 @@ class RansomwareCNN:
         }
         with open(os.path.join(model_dir, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
+        if self.calibrator is not None:
+            joblib.dump(self.calibrator, os.path.join(model_dir, "calibrator.pkl"))
         if scaler_path and self.scaler is not None:
             joblib.dump(self.scaler, scaler_path)
         print(f"  CNN saved → {model_dir}")
@@ -360,11 +529,21 @@ class RansomwareCNN:
             l2_reg          = meta.get("l2_reg", 1e-4),
             recall_target   = meta.get("recall_target", 0.85),
             threshold_floor = meta.get("threshold_floor", 0.35),
+            calibration_method = meta.get("calibration_method", "none"),
+            strict_fpr_target = meta.get("strict_fpr_target", 0.20),
+            balanced_fpr_target = meta.get("balanced_fpr_target", 0.35),
+            sensitive_min_threshold = meta.get("sensitive_min_threshold", 0.05),
+            balanced_min_threshold = meta.get("balanced_min_threshold", 0.12),
+            strict_min_threshold = meta.get("strict_min_threshold", 0.20),
         )
         obj.threshold    = meta["threshold"]
+        obj.threshold_modes = meta.get("threshold_modes", {})
         obj.feature_cols = meta.get("feature_cols")
         obj.model        = keras.models.load_model(
             os.path.join(model_dir, "model.keras"))
+        cal_path = os.path.join(model_dir, "calibrator.pkl")
+        if os.path.exists(cal_path):
+            obj.calibrator = joblib.load(cal_path)
         obj.is_trained   = True
         if scaler_path and os.path.exists(scaler_path):
             obj.scaler = joblib.load(scaler_path)

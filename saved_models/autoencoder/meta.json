@@ -72,6 +72,8 @@
   ],
   "n_features": 69,
   "threshold": 1.9815721514366733,
+  "ae_normalized_threshold": 0.00010385472647665302,
+  "ae_norm_max_error": 15376.065907857483,
   "encoder_dims": [
     128,
     64,

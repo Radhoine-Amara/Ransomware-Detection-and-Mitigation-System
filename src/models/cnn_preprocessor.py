@@ -10,6 +10,7 @@ import math
 import numpy as np
 import pandas as pd
 import joblib
+from pathlib import Path
 from sklearn.preprocessing   import RobustScaler
 from sklearn.model_selection import GroupKFold
 
@@ -41,8 +42,25 @@ CNN_FEATURE_COLS = CNN_FEATURE_COLS_DERIVED
 
 CNN_LABEL_COL = "label"
 CNN_SORT_COL  = "step_number"
-CNN_CACHE_VERSION = 4
-CNN_LABEL_POLICY = "v7_auto_evidence_dilated_active_labels"
+CNN_CACHE_VERSION = 6
+CNN_LABEL_POLICY = "v8_1_hard_benign_metadata_threshold_modes"
+
+# Hard-benign negative controls. These are benign workloads that intentionally
+# look partially ransomware-like (compression, backup, large file copy, etc.).
+# They remain label=0, but are tracked separately for evaluation/reporting.
+HARD_BENIGN_FILENAMES = {f"benign_{i:03d}.csv" for i in range(21, 32)}
+HARD_BENIGN_DIR_NAMES = {"hard_benign", "benign_hard"}
+
+
+def is_hard_benign_path(path: str) -> bool:
+    """Return True for known hard-benign telemetry CSVs.
+
+    Supports both dedicated folders and the current project convention where
+    benign_021.csv ... benign_031.csv live inside data/behavioral_raw/data/.
+    """
+    parts = [x.lower() for x in Path(path).parts]
+    name = os.path.basename(path).lower()
+    return bool(name in HARD_BENIGN_FILENAMES or any(d in parts for d in HARD_BENIGN_DIR_NAMES))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,20 +120,54 @@ def _validate_split(y_train, y_val, y_test, verbose=True):
 def discover_raw_csvs(behavioral_raw_dir: str) -> dict:
     """
     Discover CSVs under data/behavioral_raw/.
+
     Ransomware: cerber/, ryuk/, wannacry/
-    Benign:     data/  (folder literally named 'data')
+    Benign:     data/ excluding hard-benign filenames
+    Hard benign: benign_021.csv..benign_031.csv even when inside data/, plus
+                 optional hard_benign/ and benign_hard/ folders.
+
+    Hard benign samples keep label=0, but are tracked separately so the notebook
+    can report hard-benign window FPR and process-level false-block rates.
     """
-    ransomware_csvs, benign_csvs = [], []
+    ransomware_csvs, benign_csvs, hard_benign_csvs = [], [], []
     for d in ["cerber", "ryuk", "wannacry"]:
         folder = os.path.join(behavioral_raw_dir, d)
         if os.path.isdir(folder):
             ransomware_csvs.extend(sorted(glob.glob(os.path.join(folder, "*.csv"))))
-    for d in ["data"]:
+
+    data_folder = os.path.join(behavioral_raw_dir, "data")
+    if os.path.isdir(data_folder):
+        for path in sorted(glob.glob(os.path.join(data_folder, "*.csv"))):
+            if is_hard_benign_path(path):
+                hard_benign_csvs.append(path)
+            else:
+                benign_csvs.append(path)
+
+    for d in sorted(HARD_BENIGN_DIR_NAMES):
         folder = os.path.join(behavioral_raw_dir, d)
         if os.path.isdir(folder):
-            benign_csvs.extend(sorted(glob.glob(os.path.join(folder, "*.csv"))))
-    return {"ransomware": ransomware_csvs, "benign": benign_csvs,
-            "all": ransomware_csvs + benign_csvs}
+            hard_benign_csvs.extend(sorted(glob.glob(os.path.join(folder, "*.csv"))))
+
+    # Remove accidental duplicates while preserving deterministic order.
+    def _unique(seq):
+        seen, out = set(), []
+        for x in seq:
+            key = os.path.abspath(x)
+            if key not in seen:
+                seen.add(key); out.append(x)
+        return out
+
+    ransomware_csvs = _unique(ransomware_csvs)
+    benign_csvs = _unique(benign_csvs)
+    hard_benign_csvs = _unique(hard_benign_csvs)
+    benign_all = benign_csvs + hard_benign_csvs
+    return {
+        "ransomware": ransomware_csvs,
+        "benign": benign_all,
+        "benign_normal": benign_csvs,
+        "hard_benign": hard_benign_csvs,
+        "all": ransomware_csvs + benign_all,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,7 +340,8 @@ def _maybe_apply_evidence_relabeling(
 
 
 def _load_csvs(csv_paths, forced_label, feature_cols_base, verbose,
-               relabel_policy="auto_evidence", label_evidence_thresholds=None):
+               relabel_policy="auto_evidence", label_evidence_thresholds=None,
+               sample_type: str = None):
     frames = []
     for path in csv_paths:
         try:
@@ -332,7 +385,17 @@ def _load_csvs(csv_paths, forced_label, feature_cols_base, verbose,
                   f"{before_pos}/{n_tot} → {after_pos}/{n_tot} "
                   f"({after_pos/max(n_tot,1):.1%}) via {relabel_source}")
 
-        keep = feature_cols_base + ["session_id", "pid", CNN_SORT_COL, CNN_LABEL_COL]
+        # Metadata is not used as model input, but is retained for subgroup
+        # evaluation (especially hard-benign negative controls).
+        if sample_type is None:
+            df["sample_type"] = "hard_benign" if is_hard_benign_path(path) else ("ransomware" if forced_label == 1 else "benign")
+        else:
+            df["sample_type"] = sample_type
+        df["source_file"] = os.path.basename(path)
+        df["source_path"] = os.path.normpath(path)
+
+        keep = feature_cols_base + ["session_id", "pid", CNN_SORT_COL, CNN_LABEL_COL,
+                                    "sample_type", "source_file", "source_path"]
         frames.append(df[[c for c in keep if c in df.columns]].copy())
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
@@ -347,6 +410,11 @@ def _print_label_audit(df: pd.DataFrame, stage: str = "raw"):
     neg = int((df[CNN_LABEL_COL] == 0).sum())
     print(f"  [Label audit:{stage}] ticks benign={neg:,} ransomware={pos:,} "
           f"ran%={pos/max(n,1):.1%}")
+    if "sample_type" in df.columns:
+        counts = df.groupby("sample_type")[CNN_LABEL_COL].agg(["count", "sum", "mean"]).sort_index()
+        print(f"  [Label audit:{stage}] sample_type distribution:")
+        for st, row in counts.iterrows():
+            print(f"    - {st:<12} ticks={int(row['count']):,} pos={int(row['sum']):,} ran%={float(row['mean']):.1%}")
     if "_gkey" in df.columns:
         sess = df.groupby("_gkey")[CNN_LABEL_COL].agg(["count", "sum", "mean"])
         n_all_pos = int((sess["mean"] == 1.0).sum())
@@ -450,10 +518,15 @@ def preprocess_dynamic_telemetry(
                 if verbose:
                     print(f"  X_train:{X_tr.shape} X_val:{X_va.shape} X_test:{X_te.shape}")
                     print(f"  class_weight={cw}")
+                extra = {}
+                for key in ["test_window_group", "test_window_sample_type", "test_window_source_file",
+                            "val_window_group", "val_window_sample_type", "train_window_sample_type"]:
+                    if key in loaded.files:
+                        extra[key] = loaded[key].astype(str)
                 return {"X_train":X_tr,"y_train":y_tr,"X_val":X_va,"y_val":y_va,
                         "X_test":X_te,"y_test":y_te,"scaler":scaler,
                         "feature_cols":feature_cols,"input_shape":X_tr.shape[1:],
-                        "class_weight":cw,"session_ids_test":set()}
+                        "class_weight":cw,"session_ids_test":set(), **extra}
         except Exception as e:
             if verbose and "shape mismatch" not in str(e) and "rejected" not in str(e):
                 print(f"  Cache load failed ({e}), reprocessing.")
@@ -468,23 +541,32 @@ def preprocess_dynamic_telemetry(
     csv_map = discover_raw_csvs(behavioral_raw_dir)
     if verbose:
         print(f"  Ransomware CSVs: {len(csv_map['ransomware'])} | "
-              f"Benign CSVs: {len(csv_map['benign'])}")
+              f"Benign CSVs: {len(csv_map['benign_normal'])} | "
+              f"Hard-benign CSVs: {len(csv_map['hard_benign'])}")
 
     df_ran = _load_csvs(
         csv_map["ransomware"], 1, feature_cols_base, verbose,
         relabel_policy=relabel_policy,
         label_evidence_thresholds=label_evidence_thresholds,
+        sample_type="ransomware",
     )
     df_ben = _load_csvs(
-        csv_map["benign"], 0, feature_cols_base, verbose,
+        csv_map["benign_normal"], 0, feature_cols_base, verbose,
         relabel_policy="preserve",
         label_evidence_thresholds=label_evidence_thresholds,
+        sample_type="benign",
+    )
+    df_hard = _load_csvs(
+        csv_map["hard_benign"], 0, feature_cols_base, verbose,
+        relabel_policy="preserve",
+        label_evidence_thresholds=label_evidence_thresholds,
+        sample_type="hard_benign",
     )
 
-    if df_ran.empty and df_ben.empty:
+    if df_ran.empty and df_ben.empty and df_hard.empty:
         raise ValueError("No CSVs loaded.")
 
-    df_all = pd.concat([df_ran, df_ben], ignore_index=True)
+    df_all = pd.concat([df_ran, df_ben, df_hard], ignore_index=True)
 
     # ── Add derived ratio features (encryption proxy) ──────────────────────────
     df_all = _add_derived_features(df_all)
@@ -539,8 +621,9 @@ def preprocess_dynamic_telemetry(
         joblib.dump(scaler, scaler_path)
         if verbose: print(f"  RobustScaler saved → {scaler_path}")
 
-    def _to_windows(df):
+    def _to_windows(df, return_meta=False):
         all_X, all_y = [], []
+        meta_group, meta_type, meta_file = [], [], []
         for gkey, grp in df.groupby("_gkey"):
             grp = grp.sort_values(CNN_SORT_COL)
             Xw, yw = _build_windows(
@@ -550,17 +633,32 @@ def preprocess_dynamic_telemetry(
                 majority_pos_fraction=majority_pos_fraction)
             if len(Xw):
                 all_X.append(Xw); all_y.append(yw)
+                sample_type = str(grp["sample_type"].iloc[0]) if "sample_type" in grp.columns else "unknown"
+                source_file = str(grp["source_file"].iloc[0]) if "source_file" in grp.columns else str(gkey)
+                meta_group.extend([str(gkey)] * len(yw))
+                meta_type.extend([sample_type] * len(yw))
+                meta_file.extend([source_file] * len(yw))
         if not all_X:
-            return (np.empty((0, window_size, len(feature_cols)), dtype=np.float32),
-                    np.empty((0,), dtype=np.int32))
-        return np.concatenate(all_X), np.concatenate(all_y)
+            X0 = np.empty((0, window_size, len(feature_cols)), dtype=np.float32)
+            y0 = np.empty((0,), dtype=np.int32)
+            if return_meta:
+                return X0, y0, {"group": np.array([], dtype=object),
+                                "sample_type": np.array([], dtype=object),
+                                "source_file": np.array([], dtype=object)}
+            return X0, y0
+        X = np.concatenate(all_X); y = np.concatenate(all_y)
+        if return_meta:
+            return X, y, {"group": np.array(meta_group, dtype=object),
+                          "sample_type": np.array(meta_type, dtype=object),
+                          "source_file": np.array(meta_file, dtype=object)}
+        return X, y
 
     if verbose:
         label_strategy = f"positive-fraction (≥{majority_pos_fraction:.0%})"
         print(f"  Building windows (ws={window_size}, step={step_size}, label={label_strategy}) ...")
-    X_train, y_train = _to_windows(df_tr)
-    X_val,   y_val   = _to_windows(df_va)
-    X_test,  y_test  = _to_windows(df_te)
+    X_train, y_train, meta_train = _to_windows(df_tr, return_meta=True)
+    X_val,   y_val,   meta_val   = _to_windows(df_va, return_meta=True)
+    X_test,  y_test,  meta_test  = _to_windows(df_te, return_meta=True)
 
     valid, reason = _validate_split(y_train, y_val, y_test, verbose=verbose)
     if not valid:
@@ -577,7 +675,13 @@ def preprocess_dynamic_telemetry(
                             window_size_meta=np.array([window_size], dtype=np.int32),
                             majority_pos_fraction_meta=np.array([majority_pos_fraction], dtype=np.float32),
                             relabel_policy_meta=np.array([str(relabel_policy)], dtype=object),
-                            feature_cols_meta=np.array(feature_cols, dtype=object))
+                            feature_cols_meta=np.array(feature_cols, dtype=object),
+                            train_window_sample_type=meta_train["sample_type"],
+                            val_window_group=meta_val["group"],
+                            val_window_sample_type=meta_val["sample_type"],
+                            test_window_group=meta_test["group"],
+                            test_window_sample_type=meta_test["sample_type"],
+                            test_window_source_file=meta_test["source_file"])
         joblib.dump(scaler, npz_cache.replace(".npz", "_scaler.pkl"))
         if verbose: print(f"  ✓ Cache saved → {npz_cache}")
 
@@ -606,10 +710,21 @@ def preprocess_dynamic_telemetry(
         print(f"  class_weight={cw}  "
               f"(raw ratio {raw_weight:.2f}:1 → capped at 5.0)")
         print(f"  input_shape={X_train.shape[1:]}")
+        for split_name, meta in [("train", meta_train), ("val", meta_val), ("test", meta_test)]:
+            if len(meta["sample_type"]):
+                vals, counts = np.unique(meta["sample_type"], return_counts=True)
+                dist = ", ".join(f"{v}={int(c)}" for v, c in zip(vals, counts))
+                print(f"  {split_name}_window_sample_types: {dist}")
 
     return {"X_train":X_train,"y_train":y_train,
             "X_val":X_val,    "y_val":y_val,
             "X_test":X_test,  "y_test":y_test,
             "scaler":scaler,"feature_cols":feature_cols,
             "input_shape":X_train.shape[1:],
-            "class_weight":cw,"session_ids_test":test_groups}
+            "class_weight":cw,"session_ids_test":test_groups,
+            "train_window_sample_type": meta_train["sample_type"],
+            "val_window_group": meta_val["group"],
+            "val_window_sample_type": meta_val["sample_type"],
+            "test_window_group": meta_test["group"],
+            "test_window_sample_type": meta_test["sample_type"],
+            "test_window_source_file": meta_test["source_file"]}

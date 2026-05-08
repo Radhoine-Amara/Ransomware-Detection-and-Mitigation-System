@@ -1,6 +1,6 @@
 # src/engine/edr_orchestrator.py
 # =============================================================================
-# Hybrid EDR Orchestrator v7
+# Hybrid EDR Orchestrator v8.4
 # Static memory prior + dynamic CNN + evidence-aware state machine
 # =============================================================================
 
@@ -36,7 +36,7 @@ class RiskState:
 
 class EDROrchestrator:
     """
-    Hybrid EDR Orchestrator v7.
+    Hybrid EDR Orchestrator v8.4.
 
     Design goals
     ------------
@@ -65,6 +65,28 @@ class EDROrchestrator:
         "cpu_min": 15.0,                   # average CPU percent
         "open_files_min": 5.0,             # max open files
         "min_hits": 3,                     # number of conditions required
+
+        # V8.2: Generic high-I/O is not enough to suspend a SAFE/WATCH process.
+        # These stricter criteria are used to decide whether dynamic evidence is
+        # ransomware-specific enough for SOFT_BLOCK when Layer 1 is only weak.
+        "specific_min_hits": 6,
+        "specific_write_min_bytes": 1 * 1024 * 1024,
+        "specific_read_min_bytes": 256 * 1024,
+        "specific_ratio_min": 1.0,
+        "specific_ratio_max": 25.0,
+        "specific_cpu_write_min": 50_000_000.0,
+        "specific_write_intensity_min": 1024.0,
+        "specific_cpu_min": 20.0,
+        "specific_open_files_min": 50.0,
+
+        # V8.4: scoring gate for weak-memory contexts. The gate is not
+        # all-or-nothing: ransomware-specific behavior is identified by a
+        # minimum number of concurrent signals plus sustained evidence.
+        # This allows behavioral ransomware to SOFT_BLOCK while hard-benign
+        # high-I/O workloads remain ALERT_ONLY.
+        "specific_score_min": 5,
+        "specific_streak_min": 5,
+        "specific_risk_min": 0.50,
     }
 
     def __init__(
@@ -90,6 +112,16 @@ class EDROrchestrator:
         risk_soft_threshold: float = 0.50,
         evidence_persistence_windows: int = 5,
         strong_evidence_hits: int = 5,
+        # V8.2: stronger guardrails for SAFE/WATCH contexts.
+        # Generic high-I/O becomes alert-only first. Suspension requires
+        # ransomware-specific evidence.
+        watch_risk_soft_threshold: float = 0.70,
+        watch_evidence_persistence_windows: int = 8,
+        watch_strong_evidence_hits: int = 6,
+        alert_only_risk_threshold: float = 0.50,
+        alert_only_persistence_windows: int = 5,
+        policy_mode: str = "balanced",
+        history_max_steps: int = 20,
         verbose: bool = False,
     ):
         self.static_model = static_model
@@ -120,6 +152,13 @@ class EDROrchestrator:
         self.risk_soft_threshold = float(risk_soft_threshold)
         self.evidence_persistence_windows = int(evidence_persistence_windows)
         self.strong_evidence_hits = int(strong_evidence_hits)
+        self.watch_risk_soft_threshold = float(watch_risk_soft_threshold)
+        self.watch_evidence_persistence_windows = int(watch_evidence_persistence_windows)
+        self.watch_strong_evidence_hits = int(watch_strong_evidence_hits)
+        self.alert_only_risk_threshold = float(alert_only_risk_threshold)
+        self.alert_only_persistence_windows = int(alert_only_persistence_windows)
+        self.policy_mode = str(policy_mode or "balanced")
+        self.history_max_steps = int(history_max_steps)
         self.verbose = verbose
 
         self.evidence_thresholds = dict(self.DEFAULT_EVIDENCE_THRESHOLDS)
@@ -227,11 +266,30 @@ class EDROrchestrator:
             return RiskState.WATCH
         return RiskState.SAFE
 
-    def _adaptive_cnn_threshold(self, p1_effective: float) -> float:
-        base = float(getattr(self.cnn_model, "threshold", 0.5))
+    def _cnn_threshold_mode_for_state(self, risk_state: str) -> str:
+        """Choose a CNN operating point based on Layer 1 state.
+
+        V8 formalises threshold modes:
+          SAFE/WATCH      -> strict or balanced threshold, evidence required
+          SUSPICIOUS      -> balanced threshold
+          HIGH/CRITICAL   -> sensitive threshold
+        The policy remains balanced at the process level because hard kill is
+        still blocked unless Layer 1 is at least SUSPICIOUS.
+        """
+        if risk_state in (RiskState.HIGH_RISK, RiskState.CRITICAL):
+            return "sensitive"
+        if risk_state == RiskState.SUSPICIOUS:
+            return "balanced"
+        # SAFE/WATCH: reduce window-level FPs. Evidence fallback can still soft-block.
+        return "strict" if self.policy_mode in ("balanced", "safe") else "balanced"
+
+    def _adaptive_cnn_threshold(self, p1_effective: float, risk_state: str = None) -> tuple[float, str]:
+        modes = getattr(self.cnn_model, "threshold_modes", {}) or {}
+        mode = self._cnn_threshold_mode_for_state(risk_state or self._risk_state(p1_effective))
+        base = float(modes.get(mode, {}).get("threshold", getattr(self.cnn_model, "threshold", 0.5)))
         # Layer 1 suspicion lowers Layer 2 threshold, but never below min.
         risk_excess = max(0.0, p1_effective - self.l1_suspicious_threshold)
-        return float(max(self.min_cnn_threshold, base - self.adaptive_alpha * risk_excess))
+        return float(max(self.min_cnn_threshold, base - self.adaptive_alpha * risk_excess)), mode
 
     def _required_strikes(self, risk_state: str) -> int:
         if risk_state == RiskState.CRITICAL:
@@ -256,6 +314,76 @@ class EDROrchestrator:
         hits = float(evidence.get("evidence_hits", 0.0))
         evidence_strength = min(1.0, hits / 7.0)
         return float(max(l2_prob, evidence_strength))
+
+    def _is_weak_memory_state(self, risk_state: str) -> bool:
+        """True when Layer 1 is not strong enough to justify process suspension
+        from generic high-I/O behavior alone."""
+        return risk_state in (RiskState.SAFE, RiskState.WATCH)
+
+    def _ransomware_specific_evidence(self, evidence: Dict[str, float]) -> bool:
+        """Score-based ransomware-specific evidence gate for SAFE/WATCH.
+
+        V8.2 used an all-conditions gate. That protected hard-benign workloads,
+        but it also overcorrected: ransomware simulation became ALERT_ONLY. V8.4
+        uses a score instead of an all-or-nothing rule. A process must show a
+        sustained combination of ransomware-like signals before a SAFE/WATCH
+        process is suspended.
+
+        Key idea:
+          generic high I/O       -> ALERT_ONLY
+          sustained encryption   -> SOFT_BLOCK
+
+        The function writes diagnostic fields back into ``evidence`` so the
+        notebook can explain why a process was or was not soft-blocked.
+        """
+        t = self.evidence_thresholds
+        ratio = float(evidence.get("max_write_read_ratio", 0.0))
+
+        signals = {
+            "specific_write_volume": evidence.get("avg_write_bytes", 0.0) >= float(t.get("specific_write_min_bytes", 1 * 1024 * 1024)),
+            "specific_read_volume": evidence.get("avg_read_bytes", 0.0) >= float(t.get("specific_read_min_bytes", 256 * 1024)),
+            "specific_ratio_band": ratio >= float(t.get("specific_ratio_min", 1.0)) and ratio <= float(t.get("specific_ratio_max", 25.0)),
+            "specific_cpu_write_coupling": evidence.get("max_cpu_x_write", 0.0) >= float(t.get("specific_cpu_write_min", 50_000_000.0)),
+            "specific_write_intensity": evidence.get("max_io_write_intensity", 0.0) >= float(t.get("specific_write_intensity_min", 1024.0)),
+            "specific_cpu_activity": evidence.get("avg_cpu_percent", 0.0) >= float(t.get("specific_cpu_min", 20.0)),
+            "specific_open_file_pressure": evidence.get("max_open_files", 0.0) >= float(t.get("specific_open_files_min", 50.0)),
+        }
+        score = int(sum(bool(v) for v in signals.values()))
+        evidence.update({k: float(v) for k, v in signals.items()})
+        evidence["ransomware_specific_score"] = float(score)
+
+        # Core ransomware behavior: heavy writes + CPU/write coupling + either
+        # many open files or abnormal write intensity. This avoids suspending a
+        # plain high-throughput file copy or backup that lacks encryption-like
+        # coupling.
+        core_present = bool(
+            signals["specific_write_volume"]
+            and signals["specific_cpu_write_coupling"]
+            and (signals["specific_open_file_pressure"] or signals["specific_write_intensity"])
+        )
+        sustained = bool(
+            evidence.get("evidence_streak", 0.0) >= float(t.get("specific_streak_min", 5))
+            and evidence.get("l2_risk_score", 0.0) >= float(t.get("specific_risk_min", 0.50))
+        )
+        passed = bool(
+            score >= int(t.get("specific_score_min", 5))
+            and core_present
+            and sustained
+        )
+        evidence["ransomware_specific_core_present"] = float(core_present)
+        evidence["ransomware_specific_sustained"] = float(sustained)
+        evidence["ransomware_specific_passed"] = float(passed)
+        return passed
+
+    def _state_soft_policy(self, risk_state: str) -> Tuple[float, int, int]:
+        """Return state-aware risk/streak/hit requirements for SOFT_BLOCK."""
+        if self._is_weak_memory_state(risk_state):
+            return (self.watch_risk_soft_threshold,
+                    self.watch_evidence_persistence_windows,
+                    self.watch_strong_evidence_hits)
+        return (self.risk_soft_threshold,
+                self.evidence_persistence_windows,
+                self.strong_evidence_hits)
 
     # ---------------------------------------------------------------------
     # Layer 2 helpers
@@ -326,6 +454,8 @@ class EDROrchestrator:
         return hits >= int(t.get("min_hits", 3)), metrics
 
     def _predict_l2(self, window_raw: np.ndarray, scaler) -> float:
+        if hasattr(self.cnn_model, "predict_proba_raw_window"):
+            return float(self.cnn_model.predict_proba_raw_window(window_raw, scaler=scaler))
         window_scaled = scaler.transform(window_raw)
         return float(self.cnn_model.model.predict(window_scaled[np.newaxis, ...], verbose=0)[0, 0])
 
@@ -369,6 +499,50 @@ class EDROrchestrator:
                 f"indicates high forensic risk, but is below the critical hard-block "
                 f"threshold {self.l1_critical_threshold:.0%}. Process should be "
                 f"suspended and monitored with Layer 2 confirmation."
+            ),
+        )
+
+    def _alert_only_response(
+        self,
+        confidence: float,
+        step: int,
+        pid: int,
+        process_name: str,
+        p1_effective: float,
+        risk_state: str,
+        evidence: Dict[str, float],
+        theta: float,
+        trigger_reason: str = "generic_high_io_alert_only",
+    ) -> SystemEvent:
+        """Non-disruptive response for generic high-I/O evidence in SAFE/WATCH.
+
+        This is the V8.2 hard-benign protection layer. It keeps analyst visibility
+        without suspending backup/compression/copy-like workloads unless the
+        evidence becomes ransomware-specific or Layer 1 is stronger.
+        """
+        return SystemEvent(
+            alert=True,
+            severity=SEVERITY_MEDIUM,
+            model_source="EDR_Layer2_ALERT_ONLY_GENERIC_IO",
+            confidence=round(confidence, 4),
+            pid=pid,
+            process_name=process_name,
+            recommended_actions=[ACTION_SEND_ALERT, ACTION_LOG_EVENT],
+            features={"l1_effective_probability": p1_effective,
+                      "risk_state": risk_state, "cnn_threshold": theta,
+                      "l2_probability": confidence,
+                      "trigger_reason": trigger_reason,
+                      "policy_mode": self.policy_mode,
+                      "ransomware_specific_evidence": 0.0,
+                      **evidence},
+            raw_prediction=1,
+            description=(
+                f"ALERT ONLY at step {step} — generic high-I/O/encryption-like "
+                f"evidence observed, but Layer 1 is {risk_state} and the evidence "
+                f"did not pass the stricter ransomware-specific gate. "
+                f"No suspension or kill is recommended. L1_effective={p1_effective:.1%}; "
+                f"risk={evidence.get('l2_risk_score', 0):.2f}; "
+                f"evidence_hits={int(evidence.get('evidence_hits', 0))}."
             ),
         )
 
@@ -418,7 +592,9 @@ class EDROrchestrator:
                                      ACTION_SEND_ALERT, ACTION_NETWORK_BLOCK],
                 features={"l1_effective_probability": p1_effective,
                           "risk_state": risk_state, "cnn_threshold": theta,
+                          "l2_probability": confidence,
                           "trigger_reason": trigger_reason,
+                          "policy_mode": self.policy_mode,
                           **evidence},
                 raw_prediction=1,
                 description=(
@@ -440,7 +616,9 @@ class EDROrchestrator:
             recommended_actions=[ACTION_SUSPEND_PROC, ACTION_SEND_ALERT, ACTION_LOG_EVENT],
             features={"l1_effective_probability": p1_effective,
                       "risk_state": risk_state, "cnn_threshold": theta,
+                      "l2_probability": confidence,
                       "trigger_reason": trigger_reason,
+                      "policy_mode": self.policy_mode,
                       **evidence},
             raw_prediction=1,
             description=(
@@ -507,7 +685,9 @@ class EDROrchestrator:
         evidence_streak = 0
         max_evidence_streak = 0
         last_evidence: Dict[str, float] = {}
+        history_records: List[Dict[str, float]] = []
         last_theta = float(getattr(self.cnn_model, "threshold", 0.5))
+        last_threshold_mode = "balanced"
 
         for step_idx, tick in enumerate(telemetry_stream):
             tick = self._ensure_tick_features(tick, feat_cols)
@@ -527,9 +707,10 @@ class EDROrchestrator:
             elapsed = time.time() - t0
             l1_effective = self._decay_l1_prob(l1_prob_initial, elapsed)
             risk_state = self._risk_state(l1_effective)
-            theta = self._adaptive_cnn_threshold(l1_effective)
+            theta, threshold_mode = self._adaptive_cnn_threshold(l1_effective, risk_state)
             required = self._required_strikes(risk_state)
             last_theta = theta
+            last_threshold_mode = threshold_mode
 
             window_raw = np.array(tick_buf[-ws:], dtype=np.float32)
             l2_prob = self._predict_l2(window_raw, scaler)
@@ -549,7 +730,27 @@ class EDROrchestrator:
 
             evidence["l2_risk_score"] = float(risk_score)
             evidence["evidence_streak"] = float(evidence_streak)
-            evidence["risk_soft_threshold"] = float(self.risk_soft_threshold)
+            ransomware_specific = self._ransomware_specific_evidence(evidence)
+            evidence["ransomware_specific_evidence"] = float(ransomware_specific)
+            state_risk_soft, state_persistence, state_strong_hits = self._state_soft_policy(risk_state)
+            evidence["risk_soft_threshold"] = float(state_risk_soft)
+            evidence["state_evidence_persistence_windows"] = float(state_persistence)
+            evidence["state_strong_evidence_hits"] = float(state_strong_hits)
+            evidence["threshold_mode"] = threshold_mode
+            history_records.append({
+                "step": float(step_idx + 1),
+                "l2_probability": float(l2_prob),
+                "cnn_threshold": float(theta),
+                "threshold_mode": threshold_mode,
+                "evidence_present": float(bool(evidence_present)),
+                "evidence_hits": float(evidence.get("evidence_hits", 0.0)),
+                "ransomware_specific_evidence": float(ransomware_specific),
+                "risk_score": float(risk_score),
+                "evidence_streak": float(evidence_streak),
+                "counted_strikes": float(counted_strikes),
+            })
+            if len(history_records) > self.history_max_steps:
+                history_records = history_records[-self.history_max_steps:]
             last_evidence = evidence
 
             if self.verbose:
@@ -562,32 +763,67 @@ class EDROrchestrator:
             # SOFT_BLOCK even when CNN scores are bursty and do not satisfy the
             # non-overlapping strike rule. This does not hard-kill while Layer 1
             # is SAFE/WATCH; _dynamic_response enforces that policy.
+            state_risk_soft, state_persistence, state_strong_hits = self._state_soft_policy(risk_state)
+            weak_memory = self._is_weak_memory_state(risk_state)
             persistent_evidence = (
                 evidence_present
-                and evidence_streak >= self.evidence_persistence_windows
-                and risk_score >= self.risk_soft_threshold
+                and evidence_streak >= state_persistence
+                and risk_score >= state_risk_soft
             )
             strong_persistent_evidence = (
                 evidence_present
-                and evidence.get("evidence_hits", 0.0) >= self.strong_evidence_hits
-                and evidence_streak >= max(3, self.evidence_persistence_windows - 2)
+                and evidence.get("evidence_hits", 0.0) >= state_strong_hits
+                and evidence_streak >= max(3, state_persistence - 2)
             )
-            if persistent_evidence or strong_persistent_evidence:
-                return self._dynamic_response(
+
+            # V8.2 hard-benign protection:
+            # In SAFE/WATCH, generic high-I/O evidence becomes ALERT_ONLY first.
+            # SOFT_BLOCK requires ransomware-specific evidence.
+            generic_alert_only = (
+                weak_memory
+                and evidence_present
+                and not ransomware_specific
+                and evidence_streak >= self.alert_only_persistence_windows
+                and risk_score >= self.alert_only_risk_threshold
+            )
+            if generic_alert_only:
+                return self._alert_only_response(
                     confidence=max(l2_prob, risk_score),
                     step=step_idx + 1,
                     pid=pid,
                     process_name=process_name,
                     p1_effective=l1_effective,
                     risk_state=risk_state,
-                    evidence=evidence,
-                    strikes=max(counted_strikes, 1),
-                    required_strikes=required,
+                    evidence={**evidence, "risk_timeline_tail": history_records[-self.history_max_steps:]},
                     theta=theta,
-                    trigger_reason="risk_accumulator_evidence_fallback",
+                    trigger_reason="generic_high_io_alert_only",
                 )
 
-            if l2_prob >= theta and (evidence_present or not self.require_encryption_evidence):
+            if persistent_evidence or strong_persistent_evidence:
+                if weak_memory and not ransomware_specific:
+                    # Keep monitoring until generic high-I/O is either resolved or
+                    # becomes ransomware-specific enough for suspension.
+                    pass
+                else:
+                    return self._dynamic_response(
+                        confidence=max(l2_prob, risk_score),
+                        step=step_idx + 1,
+                        pid=pid,
+                        process_name=process_name,
+                        p1_effective=l1_effective,
+                        risk_state=risk_state,
+                        evidence={**evidence, "risk_timeline_tail": history_records[-self.history_max_steps:]},
+                        strikes=max(counted_strikes, 1),
+                        required_strikes=required,
+                        theta=theta,
+                        trigger_reason="risk_accumulator_evidence_fallback",
+                    )
+
+            strike_evidence_ok = (evidence_present or not self.require_encryption_evidence)
+            if weak_memory and self.require_encryption_evidence:
+                strike_evidence_ok = strike_evidence_ok and ransomware_specific
+
+            if l2_prob >= theta and strike_evidence_ok:
                 # Avoid treating overlapping windows as independent evidence.
                 enough_gap = (step_idx + 1 - last_counted_step) >= (ws if self.non_overlapping_strikes else 1)
                 if enough_gap:
@@ -606,7 +842,7 @@ class EDROrchestrator:
                         process_name=process_name,
                         p1_effective=l1_effective,
                         risk_state=risk_state,
-                        evidence=evidence,
+                        evidence={**evidence, "risk_timeline_tail": history_records[-self.history_max_steps:]},
                         strikes=counted_strikes,
                         required_strikes=required,
                         theta=theta,
@@ -637,6 +873,8 @@ class EDROrchestrator:
                           "max_l2_probability": max_l2,
                           "max_l2_risk_score": max_risk_score,
                           "max_evidence_streak": max_evidence_streak,
+                          "last_threshold_mode": last_threshold_mode,
+                          "risk_timeline_tail": history_records[-self.history_max_steps:],
                           **last_evidence},
                 description=(
                     f"WATCH — Layer 1 preprocessing/schema error occurred, so the "
@@ -664,6 +902,8 @@ class EDROrchestrator:
                       "max_counted_strikes": max_counted_strikes,
                       "max_l2_risk_score": max_risk_score,
                       "max_evidence_streak": max_evidence_streak,
+                      "last_threshold_mode": last_threshold_mode,
+                      "risk_timeline_tail": history_records[-self.history_max_steps:],
                       **last_evidence},
             description=(
                 f"No mitigation over {len(telemetry_stream)} steps. "

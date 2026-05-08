@@ -57,59 +57,78 @@ def cnn_occlusion_explanation(
     """
     Explain a CNN alert by feature occlusion.
 
-    Important implementation detail: by default, base-feature occlusion is
-    coherent. If io_write_bytes_delta is replaced, derived features such as
-    cpu_x_write and io_write_intensity are recomputed. Without this, occlusion
-    can falsely claim that raw I/O is unimportant because derived copies of that
-    same signal were left unchanged.
+    V8.1 fixes two explanation issues:
+      1) use the same calibrated CNN prediction path as runtime inference;
+      2) do not recompute a derived feature after it is directly occluded,
+         otherwise the occlusion is silently undone and the drop becomes zero.
+
+    Base-feature occlusion remains coherent: when a raw feature such as
+    io_write_bytes_delta is changed, dependent derived features are recomputed.
     """
     if scaler is None:
         scaler = getattr(cnn_model, "scaler", None)
     if scaler is None:
         raise ValueError("A CNN scaler is required for occlusion explanation.")
 
-    model = getattr(cnn_model, "model", cnn_model)
     window_raw = np.asarray(window_raw, dtype=np.float32)
     if window_raw.ndim != 2:
         raise ValueError("window_raw must have shape (timesteps, features).")
 
-    def _predict(raw_window: np.ndarray) -> float:
-        raw_window = _recompute_derived_features(raw_window, feature_cols) if coherent else raw_window
+    base_names = {
+        "cpu_percent", "memory_rss_mb", "memory_vms_mb",
+        "io_read_bytes_delta", "io_write_bytes_delta",
+        "net_bytes_sent_delta", "num_open_files",
+    }
+    derived_names = {"write_read_ratio", "cpu_x_write", "io_write_intensity"}
+
+    def _predict(raw_window: np.ndarray, recompute: bool = True) -> float:
+        raw_window = _recompute_derived_features(raw_window, feature_cols) if (coherent and recompute) else raw_window
+        if hasattr(cnn_model, "predict_proba_raw_window"):
+            return float(cnn_model.predict_proba_raw_window(raw_window, scaler=scaler))
+        model = getattr(cnn_model, "model", cnn_model)
         scaled = scaler.transform(raw_window)
         return float(model.predict(scaled[np.newaxis, ...], verbose=0)[0, 0])
 
-    original_prob = _predict(window_raw)
-    replacement = _baseline_vector(window_raw, scaler, baseline)
-    base_names = {"cpu_percent", "memory_rss_mb", "io_read_bytes_delta", "io_write_bytes_delta", "num_open_files"}
+    original_window = _recompute_derived_features(window_raw, feature_cols) if coherent else window_raw.copy()
+    original_prob = _predict(original_window, recompute=False)
+    replacement = _baseline_vector(original_window, scaler, baseline)
 
     rows = []
     for j, name in enumerate(feature_cols):
-        occluded = window_raw.copy()
+        occluded = original_window.copy()
         occluded[:, j] = replacement[j]
-        if coherent and name in base_names:
+        # Recompute derived features only when a base feature was changed. If the
+        # derived feature itself is occluded, recomputing would erase the test.
+        recompute_after = bool(coherent and name in base_names)
+        if recompute_after:
             occluded = _recompute_derived_features(occluded, feature_cols)
-        prob = _predict(occluded)
+        prob = _predict(occluded, recompute=False)
         rows.append({
             "feature": name,
+            "feature_type": "derived" if name in derived_names else "base",
             "original_probability": original_prob,
             "occluded_probability": prob,
             "probability_drop": original_prob - prob,
+            "used_calibrated_prediction": bool(hasattr(cnn_model, "predict_proba_raw_window")),
         })
 
     rows.sort(key=lambda r: r["probability_drop"], reverse=True)
     return rows[:top_k]
 
 
-def select_explainable_windows(cnn_model, X_raw: np.ndarray, scaler=None, low: float = 0.70, high: float = 0.98, max_items: int = 10):
+def select_explainable_windows(cnn_model, X_raw: np.ndarray, scaler=None, low: float = 0.70, high: float = 0.95, max_items: int = 10):
     """Return indices of non-saturated windows suitable for occlusion examples."""
     if scaler is None:
         scaler = getattr(cnn_model, "scaler", None)
     if scaler is None:
         raise ValueError("A CNN scaler is required.")
-    model = getattr(cnn_model, "model", cnn_model)
     rows = []
     for i, w in enumerate(np.asarray(X_raw, dtype=np.float32)):
-        p = float(model.predict(scaler.transform(w)[np.newaxis, ...], verbose=0)[0, 0])
+        if hasattr(cnn_model, "predict_proba_raw_window"):
+            p = float(cnn_model.predict_proba_raw_window(w, scaler=scaler))
+        else:
+            model = getattr(cnn_model, "model", cnn_model)
+            p = float(model.predict(scaler.transform(w)[np.newaxis, ...], verbose=0)[0, 0])
         if low <= p <= high:
             rows.append((i, p))
             if len(rows) >= max_items:

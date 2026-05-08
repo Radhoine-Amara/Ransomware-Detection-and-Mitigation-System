@@ -87,10 +87,10 @@ def inject_encryption_features(
     window_raw: np.ndarray,
     feature_cols: List[str],
     multiplier: float = 8.0,
-    read_floor: float = 512 * 1024,
-    write_floor: float = 1024 * 1024,
-    cpu_floor: float = 65.0,
-    open_files_floor: float = 50.0,
+    read_floor: float = 2 * 1024 * 1024,
+    write_floor: float = 4 * 1024 * 1024,
+    cpu_floor: float = 85.0,
+    open_files_floor: float = 100.0,
 ) -> np.ndarray:
     """
     Return a coherent counterfactual copy where encryption-like behavior is
@@ -103,33 +103,45 @@ def inject_encryption_features(
     x = np.asarray(window_raw, dtype=np.float32).copy()
     idx = _idx(feature_cols)
 
+    # Create a coherent burst instead of uniformly increasing every tick. This
+    # looks more like the training distribution after V7/V8 label dilation.
+    T = x.shape[0]
+    lo = max(0, T // 4)
+    hi = T
+    sl = slice(lo, hi)
     if "io_read_bytes_delta" in idx:
-        x[:, idx["io_read_bytes_delta"]] = np.maximum(
-            x[:, idx["io_read_bytes_delta"]] * multiplier, read_floor
+        x[sl, idx["io_read_bytes_delta"]] = np.maximum(
+            x[sl, idx["io_read_bytes_delta"]] * multiplier, read_floor
         )
     if "io_write_bytes_delta" in idx:
-        x[:, idx["io_write_bytes_delta"]] = np.maximum(
-            x[:, idx["io_write_bytes_delta"]] * multiplier, write_floor
+        x[sl, idx["io_write_bytes_delta"]] = np.maximum(
+            x[sl, idx["io_write_bytes_delta"]] * multiplier, write_floor
         )
     if "cpu_percent" in idx:
-        x[:, idx["cpu_percent"]] = np.maximum(x[:, idx["cpu_percent"]], cpu_floor)
+        x[sl, idx["cpu_percent"]] = np.maximum(x[sl, idx["cpu_percent"]], cpu_floor)
     if "num_open_files" in idx:
-        x[:, idx["num_open_files"]] = np.maximum(
-            x[:, idx["num_open_files"]] * max(1.0, multiplier / 2.0), open_files_floor
+        x[sl, idx["num_open_files"]] = np.maximum(
+            x[sl, idx["num_open_files"]] * max(1.0, multiplier / 2.0), open_files_floor
         )
 
     return recompute_derived_features(x, feature_cols)
 
 
 def predict_raw_window(cnn_model, window_raw: np.ndarray, scaler=None) -> float:
-    """Predict one raw unscaled telemetry window with the CNN's scaler."""
+    """Predict one raw unscaled telemetry window with the CNN's scaler.
+
+    Uses the calibrated ``predict_proba_raw_window`` path when available so
+    counterfactual diagnostics match orchestrator/runtime probabilities.
+    """
     if scaler is None:
         scaler = getattr(cnn_model, "scaler", None)
     if scaler is None:
         raise ValueError("A CNN scaler is required.")
+    feature_cols = getattr(cnn_model, "feature_cols", None) or []
+    raw = recompute_derived_features(np.asarray(window_raw, dtype=np.float32), feature_cols) if feature_cols else np.asarray(window_raw, dtype=np.float32)
+    if hasattr(cnn_model, "predict_proba_raw_window"):
+        return float(cnn_model.predict_proba_raw_window(raw, scaler=scaler))
     model = getattr(cnn_model, "model", cnn_model)
-    raw = recompute_derived_features(np.asarray(window_raw, dtype=np.float32), getattr(cnn_model, "feature_cols", None) or []) \
-        if getattr(cnn_model, "feature_cols", None) else np.asarray(window_raw, dtype=np.float32)
     scaled = scaler.transform(raw)
     return float(model.predict(scaled[np.newaxis, ...], verbose=0)[0, 0])
 
@@ -155,6 +167,12 @@ def run_counterfactual_pair(
     injected_window = inject_encryption_features(coherent_original, feature_cols)
     suppressed = predict_raw_window(cnn_model, suppressed_window, scaler)
     injected = predict_raw_window(cnn_model, injected_window, scaler)
+    # Interpretation depends on the window type. For already-saturated
+    # ransomware-like windows, injection cannot increase a probability near 1.0;
+    # this should not be marked as a failure. For benign-like windows, injection
+    # is the meaningful direction.
+    saturated_high = bool(original >= 0.98)
+    saturated_low = bool(original <= 0.02)
     return {
         "original_probability": original,
         "suppressed_probability": suppressed,
@@ -163,6 +181,10 @@ def run_counterfactual_pair(
         "injection_increase": injected - original,
         "valid_suppression_direction": bool(original > suppressed),
         "valid_injection_direction": bool(injected > original),
+        "saturated_high": saturated_high,
+        "saturated_low": saturated_low,
+        "suppression_interpretable": bool(not saturated_low),
+        "injection_interpretable": bool(not saturated_high),
     }
 
 
