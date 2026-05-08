@@ -564,25 +564,36 @@ class RansomwareLightGBM:
 
 class RansomwareEnsemble:
     """
-    Weighted soft-voting ensemble of RF + XGB + LGB + AE (optional).
+    Recall-oriented ensemble of RF + XGB + LGB + AE (optional).
 
-    Soft voting: final_proba = Σ weight_i × proba_i
-    Threshold is tuned on validation set to achieve recall_target.
+    V7 combines weighted soft voting with a safety rule:
+      final alert = weighted_score >= tuned_threshold
+                    OR at least min_supervised_votes models cross their own tuned thresholds
+                    OR any supervised model is very confident.
+
+    This avoids the V6 failure where averaging suppressed recall even though the
+    individual supervised models were all above 90% recall.
     """
 
     def __init__(
         self,
         weights     : Dict[str, float] = None,
         recall_target: float = 0.90,
+        any_model_threshold: float = 0.85,
+        min_supervised_votes: int = 2,
     ):
-        # Default weights (RF and XGB carry most weight)
+        # V7 defaults: rely mostly on the strongest supervised tabular models.
+        # The autoencoder is useful as a novelty booster, but it should not drag
+        # down the supervised ransomware recall in the main Layer 1 score.
         self.weights = weights or {
-            'random_forest' : 0.35,
-            'xgboost'       : 0.35,
-            'lightgbm'      : 0.20,
-            'autoencoder'   : 0.10,
+            'random_forest' : 0.45,
+            'lightgbm'      : 0.40,
+            'xgboost'       : 0.15,
+            'autoencoder'   : 0.00,
         }
         self.recall_target = recall_target
+        self.any_model_threshold = float(any_model_threshold)
+        self.min_supervised_votes = int(min_supervised_votes)
         self.threshold     = 0.5
         self.models        : Dict[str, Any] = {}
         self.train_results : Dict[str, Any] = {}
@@ -633,36 +644,99 @@ class RansomwareEnsemble:
 
         return proba_sum / total_weight
 
+    def _component_probas(self, X_dict: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """Return probability-like scores for every valid component."""
+        scores: Dict[str, np.ndarray] = {}
+        for name, model in self.models.items():
+            if not getattr(model, 'is_trained', False):
+                continue
+            X_for_model = X_dict.get(name)
+            if X_for_model is None:
+                continue
+            if name == 'autoencoder':
+                errors = model.predict_errors_batch(X_for_model)
+                max_err = max(model.threshold * 5, np.percentile(errors, 99))
+                scores[name] = np.clip(errors / max_err, 0, 1)
+            else:
+                scores[name] = model.predict_proba_batch(X_for_model)
+        if not scores:
+            raise RuntimeError("No valid models in ensemble.")
+        return scores
+
+    def _fusion_predict(self, weighted_proba: np.ndarray, component_scores: Dict[str, np.ndarray],
+                        threshold: float) -> np.ndarray:
+        """Recall-oriented V7 fusion rule.
+
+        The weighted average gives a stable calibrated score. The vote/high-score
+        rules prevent a single weak component from suppressing an otherwise strong
+        ransomware signal. Autoencoder is excluded from supervised voting.
+        """
+        pred_weighted = weighted_proba >= threshold
+        supervised = {k: v for k, v in component_scores.items() if k != 'autoencoder'}
+        if not supervised:
+            return pred_weighted.astype(int)
+
+        vote_count = np.zeros_like(weighted_proba, dtype=int)
+        max_score = np.zeros_like(weighted_proba, dtype=float)
+        for name, scores in supervised.items():
+            model = self.models.get(name)
+            model_t = float(getattr(model, 'threshold', 0.5))
+            vote_count += (scores >= model_t).astype(int)
+            max_score = np.maximum(max_score, scores)
+
+        pred_votes = vote_count >= self.min_supervised_votes
+        pred_any_high = max_score >= self.any_model_threshold
+        return (pred_weighted | pred_votes | pred_any_high).astype(int)
+
     def evaluate(
         self,
         X           : pd.DataFrame,
         y           : pd.Series,
         test_size   : float = 0.20,
+        val_size    : float = 0.20,
         verbose     : bool  = True,
     ) -> Dict[str, Any]:
         """
-        Evaluate the ensemble on a held-out test set.
-        Each model scales X independently using its own scaler.
+        Evaluate the ensemble with validation-only threshold tuning.
+
+        Previous versions tuned the ensemble threshold directly on the test set,
+        which leaks test information into the final metric. This method now uses:
+
+            X/y -> validation split for threshold -> untouched test split
+
+        The component models still own their own scalers and calibrated outputs.
         """
         from sklearn.model_selection import train_test_split
-        _, X_test, _, y_test = train_test_split(
+
+        X_tmp, X_test, y_tmp, y_test = train_test_split(
             X, y, test_size=test_size, stratify=y, random_state=42)
+        val_frac = val_size / max(1.0 - test_size, 1e-9)
+        _, X_val, _, y_val = train_test_split(
+            X_tmp, y_tmp, test_size=val_frac, stratify=y_tmp, random_state=43)
 
-        # Scale X_test for each model separately
-        X_dict = {}
-        for name, model in self.models.items():
-            if hasattr(model, 'scaler') and model.scaler is not None:
-                X_dict[name] = model.scaler.transform(X_test)
+        def _scale_for_models(X_part):
+            X_dict = {}
+            for name, model in self.models.items():
+                if hasattr(model, 'scaler') and model.scaler is not None:
+                    X_dict[name] = model.scaler.transform(X_part)
+            return X_dict
 
-        proba = self._weighted_proba(X_dict)
+        # Tune threshold on validation set only, using the same V7 fusion rule
+        # that will be used on the untouched test set.
+        Xv_dict = _scale_for_models(X_val)
+        val_proba = self._weighted_proba(Xv_dict)
+        val_components = self._component_probas(Xv_dict)
+        self.threshold = self._tune_recall(val_proba, y_val, verbose, val_components)
 
-        # Tune threshold on test set
-        self.threshold = self._tune_recall(proba, y_test, verbose)
-        pred           = (proba >= self.threshold).astype(int)
+        # Evaluate once on untouched test set.
+        Xt_dict = _scale_for_models(X_test)
+        proba = self._weighted_proba(Xt_dict)
+        test_components = self._component_probas(Xt_dict)
+        pred  = self._fusion_predict(proba, test_components, self.threshold)
 
         n_cls = len(np.unique(y_test))
         if verbose:
-            print(f"\n[ENS] ── ENSEMBLE TEST SET ──────────────────────────")
+            print("\n[ENS] ── ENSEMBLE TEST SET (threshold tuned on validation) ──")
             print(classification_report(y_test, pred,
                   target_names=['Non-Ransomware','Ransomware'],
                   digits=4, zero_division=0))
@@ -670,7 +744,8 @@ class RansomwareEnsemble:
         try:
             auc = roc_auc_score(y_test, proba) if n_cls > 1 else 0.0
             ap  = average_precision_score(y_test, proba) if n_cls > 1 else 0.0
-        except Exception: auc = ap = 0.0
+        except Exception:
+            auc = ap = 0.0
 
         if verbose and n_cls > 1:
             print(f"  ROC-AUC: {auc:.4f} | Avg Precision: {ap:.4f}")
@@ -686,21 +761,39 @@ class RansomwareEnsemble:
             'y_test'    : y_test,
             'test_proba': proba,
             'threshold' : self.threshold,
+            'threshold_tuned_on': 'validation',
+            'fusion_rule': 'weighted_or_two_model_votes_or_any_high',
+            'any_model_threshold': self.any_model_threshold,
+            'min_supervised_votes': self.min_supervised_votes,
         }
         self.train_results = results
         return results
 
-    def _tune_recall(self, proba, y_true, verbose=True):
-        if len(np.unique(y_true)) < 2: return 0.5
-        best_t, best_p = 0.5, 0.0
-        for t in np.arange(0.05, 0.90, 0.01):
-            pred = (proba >= t).astype(int)
+    def _tune_recall(self, proba, y_true, verbose=True, component_scores=None):
+        if len(np.unique(y_true)) < 2:
+            return 0.5
+        best_t, best_p, best_r = 0.5, -1.0, 0.0
+        for t in np.arange(0.01, 0.95, 0.005):
+            if component_scores is not None:
+                pred = self._fusion_predict(proba, component_scores, t)
+            else:
+                pred = (proba >= t).astype(int)
             r = recall_score(y_true, pred, zero_division=0)
             p = precision_score(y_true, pred, zero_division=0)
             if r >= self.recall_target and p > best_p:
-                best_t, best_p = t, p
-        if best_p == 0: best_t = 0.10
-        if verbose: print(f"[ENS] Recall-optimised threshold: {best_t:.4f}")
+                best_t, best_p, best_r = float(t), float(p), float(r)
+        if best_p < 0:
+            best_t = 0.10
+            if component_scores is not None:
+                pred = self._fusion_predict(proba, component_scores, best_t)
+            else:
+                pred = (proba >= best_t).astype(int)
+            best_r = recall_score(y_true, pred, zero_division=0)
+            best_p = precision_score(y_true, pred, zero_division=0)
+        if verbose:
+            print(f"[ENS] V7 recall-optimised threshold: {best_t:.4f} "
+                  f"(val_recall={best_r:.3f}, val_precision={best_p:.3f}, "
+                  f"rule=weighted OR {self.min_supervised_votes} model votes OR any≥{self.any_model_threshold:.2f})")
         return float(best_t)
 
     def predict(self, features, pid=0, process_name='unknown'):
@@ -722,8 +815,21 @@ class RansomwareEnsemble:
                 X_dict[name] = fv_sc
 
         w_sum = sum(self.weights.get(n, 0) for n in component_scores)
-        final = sum(self.weights.get(n, 0) * s
-                    for n, s in component_scores.items()) / max(w_sum, 1e-9)
+        weighted = sum(self.weights.get(n, 0) * s
+                       for n, s in component_scores.items()) / max(w_sum, 1e-9)
+
+        supervised_scores = {k: v for k, v in component_scores.items() if k != 'autoencoder'}
+        votes = sum(
+            1 for name, score in supervised_scores.items()
+            if score >= float(getattr(self.models[name], 'threshold', 0.5))
+        )
+        max_supervised = max(supervised_scores.values()) if supervised_scores else weighted
+        final = max(weighted,
+                    self.threshold if votes >= self.min_supervised_votes else 0.0,
+                    self.threshold if max_supervised >= self.any_model_threshold else 0.0)
+        component_scores['_weighted_score'] = float(weighted)
+        component_scores['_supervised_votes'] = float(votes)
+        component_scores['_max_supervised'] = float(max_supervised)
 
         return make_ensemble_event(pid, process_name, final, component_scores, features)
 

@@ -1,0 +1,23 @@
+{
+  "window_size": 8,
+  "n_features": 10,
+  "threshold": 0.9375451803207397,
+  "filters_1": 64,
+  "filters_2": 128,
+  "dropout_rate": 0.4,
+  "l2_reg": 0.0001,
+  "recall_target": 0.85,
+  "threshold_floor": 0.05,
+  "feature_cols": [
+    "cpu_percent",
+    "memory_rss_mb",
+    "memory_vms_mb",
+    "io_read_bytes_delta",
+    "io_write_bytes_delta",
+    "net_bytes_sent_delta",
+    "num_open_files",
+    "write_read_ratio",
+    "cpu_x_write",
+    "io_write_intensity"
+  ]
+}
