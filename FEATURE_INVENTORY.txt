@@ -1,0 +1,381 @@
+================================================================================
+                    RANSOMWARE DETECTION SYSTEM
+                      COMPLETE FEATURE INVENTORY
+================================================================================
+Generated: May 8, 2026
+Project: Ransomware-Detection-and-Mitigation-System
+System Architecture: Two-Layer Hybrid EDR (Static Memory + Dynamic Telemetry)
+
+================================================================================
+DATASET 1: STATIC MEMORY ANALYSIS (LAYER 1)
+================================================================================
+
+Source: data/datasets/MalMem2022.csv
+Type: Volatility Memory Snapshots
+Total Features: 57 features
+Model Architecture: Random Forest + XGBoost + LightGBM (ensemble)
+Preprocessing: StandardScaler → SMOTE → Isotonic Calibration
+
+─────────────────────────────────────────────────────────────────────────────
+STATIC MEMORY FEATURES (57 TOTAL):
+─────────────────────────────────────────────────────────────────────────────
+
+CATEGORY 1: PROCESS LIST FEATURES (pslist.*)
+─────────────────────────────────────────────
+1.  pslist.nproc               - Number of processes
+2.  pslist.nppid               - Number of unique parent process IDs
+3.  pslist.avg_threads         - Average number of threads per process
+4.  pslist.nprocs64bit         - Number of 64-bit processes
+5.  pslist.avg_handlers        - Average number of handles per process
+
+CATEGORY 2: DLL LIST FEATURES (dlllist.*)
+─────────────────────────────────────────
+6.  dlllist.ndlls              - Number of unique DLLs loaded
+7.  dlllist.avg_dlls_per_proc  - Average DLLs per process
+
+CATEGORY 3: HANDLE FEATURES (handles.*)
+───────────────────────────────────────
+8.  handles.nhandles           - Total number of handles
+9.  handles.avg_handles_per_proc - Average handles per process
+10. handles.nport              - Number of port handles
+11. handles.nfile              - Number of file handles
+12. handles.nevent             - Number of event handles
+13. handles.ndesktop           - Number of desktop handles
+14. handles.nkey               - Number of registry key handles
+15. handles.nthread            - Number of thread handles
+16. handles.ndirectory         - Number of directory handles
+17. handles.nsemaphore         - Number of semaphore handles
+18. handles.ntimer             - Number of timer handles
+19. handles.nsection           - Number of section handles
+20. handles.nmutant            - Number of mutant handles
+
+CATEGORY 4: MODULE ANOMALIES (ldrmodules.*)
+──────────────────────────────────────────
+21. ldrmodules.not_in_load     - Modules not in LoadOrderList
+22. ldrmodules.not_in_init     - Modules not in InitOrderList
+23. ldrmodules.not_in_mem      - Modules not in MemoryOrderList
+24. ldrmodules.not_in_load_avg - Average modules not in load per process
+25. ldrmodules.not_in_init_avg - Average modules not in init per process
+26. ldrmodules.not_in_mem_avg  - Average modules not in mem per process
+
+CATEGORY 5: CODE INJECTION DETECTION (malfind.*)
+─────────────────────────────────────────────────
+27. malfind.ninjections        - Number of code injections detected
+28. malfind.commitCharge       - Committed charge of injected memory
+29. malfind.protection         - Memory protection flags of injections
+30. malfind.uniqueInjections   - Count of unique injection patterns
+
+CATEGORY 6: HIDDEN PROCESS DETECTION (psxview.*)
+──────────────────────────────────────────────────
+31. psxview.not_in_pslist      - Processes hidden from pslist
+32. psxview.not_in_eprocess_pool - Processes not in eprocess pool
+33. psxview.not_in_ethread_pool  - Processes not in ethread pool
+34. psxview.not_in_pspcid_list   - Processes not in pspcid list
+35. psxview.not_in_csrss_handles - Processes not in csrss handles
+36. psxview.not_in_session       - Processes not in session
+37. psxview.not_in_deskthrd      - Processes not in desktop threads
+38. psxview.not_in_pslist_false_avg - Avg pslist false positives
+39. psxview.not_in_eprocess_pool_false_avg - Avg eprocess pool false positives
+40. psxview.not_in_ethread_pool_false_avg  - Avg ethread pool false positives
+41. psxview.not_in_pspcid_list_false_avg   - Avg pspcid list false positives
+42. psxview.not_in_csrss_handles_false_avg - Avg csrss handles false positives
+43. psxview.not_in_session_false_avg       - Avg session false positives
+44. psxview.not_in_deskthrd_false_avg      - Avg desktop thread false positives
+
+CATEGORY 7: DRIVER & MODULE INFORMATION (modules.* & svcscan.*)
+──────────────────────────────────────────────────────────────
+45. modules.nmodules           - Total number of modules
+46. svcscan.nservices          - Number of services
+47. svcscan.kernel_drivers     - Number of kernel drivers
+48. svcscan.fs_drivers         - Number of filesystem drivers
+49. svcscan.process_services   - Number of process services
+50. svcscan.shared_process_services - Number of shared process services
+51. svcscan.interactive_process_services - Number of interactive services
+52. svcscan.nactive            - Number of active services
+
+CATEGORY 8: KERNEL CALLBACKS (callbacks.*)
+──────────────────────────────────────────
+53. callbacks.ncallbacks       - Total number of kernel callbacks
+54. callbacks.nanonymous       - Number of anonymous callbacks
+55. callbacks.ngeneric         - Number of generic callbacks
+
+CATEGORY 9: METADATA
+────────────────────
+56. Class                      - Class label (integer encoded)
+57. Category                   - Ransomware/Benign category
+58. Filename                   - Source file identifier
+
+KEY / FEATURED FEATURES (MEMORY LAYER):
+───────────────────────────────────────
+⭐ CODE INJECTION (malfind.ninjections, malfind.uniqueInjections)
+   → Ransomware often injects malicious code into running processes
+   
+⭐ HIDDEN PROCESSES (psxview.* anomalies)
+   → Evasion techniques hide processes from standard enumeration
+   
+⭐ ABNORMAL HANDLES (handles.* counts)
+   → Ransomware creates many file/mutex handles during encryption
+   
+⭐ MODULE ANOMALIES (ldrmodules.*)
+   → DLL injection and rootkit techniques manipulate loader structures
+   
+⭐ PROCESS HIERARCHY (pslist.nproc, pslist.nppid)
+   → Ransomware spawns abnormal process trees
+   
+⭐ SERVICE/DRIVER MANIPULATION (svcscan.*)
+   → Ransomware may modify system drivers and services
+
+
+================================================================================
+DATASET 2: DYNAMIC TELEMETRY ANALYSIS (LAYER 2) - RAW FEATURES
+================================================================================
+
+Source: data/behavioral_raw/ (sessions from cerber/, ryuk/, wannacry/, data/)
+Type: Real-time system telemetry streams
+Total Raw Features: 22 columns (timestep-based)
+Model Architecture: 1D Convolutional Neural Network (CNN)
+Preprocessing: RobustScaler → Windowing (8 ticks) → Class Balancing
+
+─────────────────────────────────────────────────────────────────────────────
+ALL RAW TELEMETRY COLUMNS (22 TOTAL):
+─────────────────────────────────────────────────────────────────────────────
+
+METADATA COLUMNS:
+─────────────────
+1.  timestamp              - Unix timestamp of the telemetry sample
+2.  session_id             - Unique identifier for the monitoring session
+3.  step_number            - Chronological sequence number within session
+4.  pid                    - Process ID being monitored
+5.  process_name           - Human-readable process name
+
+FEATURES USED BY MODEL (7 SELECTED):
+────────────────────────────────────
+6.  cpu_percent            - CPU usage percentage (0-100) ⭐ FEATURED
+7.  memory_rss_mb          - Resident set size in megabytes
+8.  memory_vms_mb          - Virtual memory size in megabytes
+9.  io_read_bytes_delta    - Bytes read since last tick ⭐ FEATURED
+10. io_write_bytes_delta   - Bytes written since last tick ⭐ FEATURED
+11. net_bytes_sent_delta   - Network bytes sent since last tick
+12. num_open_files         - Count of open file handles
+
+ADDITIONAL COLUMNS (NOT USED BY MODEL):
+────────────────────────────────────────
+13. num_threads            - Number of process threads
+14. num_handles            - Number of open handles
+15. num_fds                - Number of file descriptors
+16. io_read_count_delta    - Number of read operations
+17. io_write_count_delta   - Number of write operations
+18. net_bytes_recv_delta   - Network bytes received
+19. num_connections        - Number of network connections
+20. cpu_user_time_delta    - User-mode CPU time delta
+21. cpu_system_time_delta  - System-mode CPU time delta
+
+LABEL COLUMN:
+──────────────
+22. label                  - Class label (0=benign, 1=ransomware)
+
+
+KEY / FEATURED DYNAMIC FEATURES:
+─────────────────────────────────
+
+⭐⭐ io_write_bytes_delta
+    Importance: CRITICAL for ransomware detection
+    Rationale: Ransomware reads file → encrypts → writes back. High write 
+              rates with no corresponding user input = suspicious.
+    Threshold Pattern: Sustained high writes (>1MB/sec) = ALERT
+
+⭐⭐ io_read_bytes_delta
+    Importance: CRITICAL (paired with writes)
+    Rationale: Ransomware must read files before encrypting. Read/write 
+              ratio reveals encryption behavior.
+    Threshold Pattern: Read-Write balanced pattern = RANSOMWARE signature
+
+⭐ cpu_percent
+    Importance: HIGH (encryption CPU cost)
+    Rationale: AES encryption is computationally expensive. 
+              Sustained high CPU + high I/O = strong indicator.
+    Threshold Pattern: 80%+ CPU with high I/O = SUSPICIOUS
+
+⭐ net_bytes_sent_delta
+    Importance: MEDIUM (exfiltration detection)
+    Rationale: Some ransomware variants exfiltrate data or check-in with C2.
+    Threshold Pattern: Unexpected network bursts after encryption = ALERT
+
+⭐ num_open_files
+    Importance: HIGH (file system access pattern)
+    Rationale: Ransomware keeps many files open simultaneously during 
+              encryption pass. High FD count during encryption = signature.
+    Threshold Pattern: 100+ open files = SUSPICIOUS
+
+
+================================================================================
+DATASET 2 (EXTENDED): DYNAMIC TELEMETRY - DERIVED FEATURES
+================================================================================
+
+Type: Computed on-the-fly (not in raw CSV)
+Total Derived Features: 3 ratio/composite features
+Computation: Applied by edr_orchestrator._ensure_tick_features()
+
+─────────────────────────────────────────────────────────────────────────────
+DERIVED RATIO FEATURES (3 TOTAL):
+─────────────────────────────────────────────────────────────────────────────
+
+⭐⭐⭐ Feature 1: write_read_ratio
+────────────────────────────────────
+Formula:     io_write_bytes_delta / (io_read_bytes_delta + 1.0)
+Description: Ratio of bytes written to bytes read per tick
+Range:       [0.0 to ∞)
+Interpretation:
+  - < 1.0    : Process reading more than writing (normal)
+  - 1.0–5.0  : Balanced read-write (could be normal or suspicious)
+  - > 5.0    : Heavy write bias (HIGH RANSOMWARE SIGNAL)
+Ransomware Signal: 
+  File encryption requires read (plaintext) → process (AES) → write (ciphertext)
+  Result: write_read_ratio often > 10.0 during active encryption
+
+
+⭐⭐ Feature 2: cpu_x_write
+──────────────────────────
+Formula:     cpu_percent × io_write_bytes_delta
+Description: Product of CPU utilization and write bytes
+Range:       [0.0 to large values]
+Interpretation:
+  - Low:      CPU not busy OR minimal writes (normal)
+  - High:     Both CPU and writes are high simultaneously (SUSPICIOUS)
+Ransomware Signal:
+  AES encryption is CPU-intensive AND produces massive I/O simultaneously
+  Result: cpu_x_write spikes during encryption pass
+
+
+⭐⭐ Feature 3: io_write_intensity
+────────────────────────────────────
+Formula:     io_write_bytes_delta / (memory_rss_mb × 1024.0 + 1.0)
+Description: Write rate normalized by process memory footprint
+Range:       [0.0 to large values]
+Interpretation:
+  - Low:      Writes are small relative to process size (normal)
+  - High:     Massive writes from a small-footprint process (SUSPICIOUS)
+Ransomware Signal:
+  Ransomware stays lean in memory but churns out massive encrypted file writes
+  Result: io_write_intensity >> normal processes
+
+
+COMBINED TELEMETRY FEATURE SET:
+───────────────────────────────
+Total Features Used by CNN: 10 (7 base + 3 derived)
+Format: Each sliding window = (window_size=8 ticks, n_features=10)
+        → Shape: (N_windows, 8, 10) tensor
+
+Feature Order in Model:
+  [cpu_percent, memory_rss_mb, memory_vms_mb, io_read_bytes_delta, 
+   io_write_bytes_delta, net_bytes_sent_delta, num_open_files,
+   write_read_ratio, cpu_x_write, io_write_intensity]
+
+
+================================================================================
+DATASET SUMMARY TABLE
+================================================================================
+
+╔═══════════════════╦═══════════════╦════════════════╦════════════════════════╗
+║ LAYER             ║ SOURCE        ║ # FEATURES     ║ MODEL TYPE             ║
+╠═══════════════════╬═══════════════╬════════════════╬════════════════════════╣
+║ Layer 1 (Static)  ║ MalMem2022.csv║ 57 features    ║ RF/XGB/LightGBM        ║
+║ Layer 2 (Dynamic) ║ behavioral_   ║ 7 base         ║ 1D CNN                 ║
+║                   ║ raw/*.csv     ║ 3 derived      ║ (10 total features)    ║
+╚═══════════════════╩═══════════════╩════════════════╩════════════════════════╝
+
+LAYER 1 DECISION OUTPUT:
+  Probability(ransomware) = [0.0 - 1.0] from ensemble (RF/XGB/LightGBM)
+  Confidence: High (memory snapshots capture malicious state directly)
+
+LAYER 2 DECISION OUTPUT (PER WINDOW):
+  Probability(ransomware) = [0.0 - 1.0] from CNN
+  Temporal Aggregation: Require 3+ consecutive alert windows before blocking
+  Confidence: Medium (temporal patterns more prone to false positives)
+
+
+================================================================================
+PREPROCESSING PIPELINE SUMMARY
+================================================================================
+
+LAYER 1 (STATIC MEMORY):
+─────────────────────────
+1. Train/Val/Test Split: Stratified (80/10/10 ratio)
+2. Feature Scaling: StandardScaler (fit on training only)
+3. Class Balancing: SMOTE (training set only)
+4. Probability Calibration: Isotonic regression (fitted on validation set)
+5. Threshold Tuning: Optimize recall target (usually 95%+)
+
+LAYER 2 (DYNAMIC TELEMETRY):
+────────────────────────────
+1. Session-Level Split: GroupKFold (5 folds, session_id as group)
+   Fallback: StratifiedShuffleSplit if GroupKFold fails
+2. Feature Engineering: Compute 3 derived ratios (write_read_ratio, cpu_x_write, io_write_intensity)
+3. Feature Scaling: RobustScaler (fit on training ticks only)
+4. Windowing: Sliding window (window_size=8, step_size=1)
+5. Class Balancing: Compute_sample_weight() with sqrt-softened class ratio
+6. Window Labeling: By last tick in window (reduces label noise)
+
+
+================================================================================
+FEATURED FEATURES RANKING
+================================================================================
+
+TIER 1 - CRITICAL FOR RANSOMWARE DETECTION:
+───────────────────────────────────────────
+✓ write_read_ratio       (Derived) - Encryption signature
+✓ io_write_bytes_delta   (Raw)     - File writing intensity
+✓ io_read_bytes_delta    (Raw)     - File reading for encryption
+✓ malfind.ninjections    (Static)  - Code injection detection
+✓ cpu_x_write            (Derived) - CPU + I/O coupling
+✓ cpu_percent            (Raw)     - AES encryption cost
+
+TIER 2 - HIGH IMPORTANCE:
+─────────────────────────
+✓ io_write_intensity     (Derived) - Normalized write intensity
+✓ num_open_files         (Raw)     - File handle accumulation
+✓ psxview.* anomalies    (Static)  - Hidden process detection
+✓ handles.* counts       (Static)  - Handle usage patterns
+
+TIER 3 - SUPPORTING/CONTEXTUAL:
+────────────────────────────────
+✓ memory_rss_mb, memory_vms_mb    (Raw)     - Memory footprint
+✓ net_bytes_sent_delta             (Raw)     - Exfiltration signal
+✓ ldrmodules.* anomalies           (Static)  - DLL injection detection
+✓ svcscan.* information            (Static)  - Service manipulation
+
+
+================================================================================
+FILE LOCATIONS IN CODEBASE
+================================================================================
+
+Static Feature List (Code):
+  → src/models/random_forest_model.py    (trains on 57 features)
+  → src/models/ensemble_model.py         (XGBoost/LightGBM with 57 features)
+
+Dynamic Base Feature List (Code):
+  → src/models/cnn_preprocessor.py (line ~14-22)
+    CNN_FEATURE_COLS_BASE = ['cpu_percent', 'memory_rss_mb', 'memory_vms_mb', 
+                              'io_read_bytes_delta', 'io_write_bytes_delta',
+                              'net_bytes_sent_delta', 'num_open_files']
+
+Dynamic Derived Features (Code):
+  → src/models/cnn_preprocessor.py (line ~25-34, _add_derived_features function)
+    CNN_FEATURE_COLS_DERIVED = ['write_read_ratio', 'cpu_x_write', 
+                                'io_write_intensity']
+
+Orchestrator Feature Integration:
+  → src/engine/edr_orchestrator.py (_ensure_tick_features method)
+    Auto-fills derived columns if missing from input tick dictionary
+
+Raw Data Sources:
+  → data/datasets/MalMem2022.csv                    (Static: 57 features)
+  → data/behavioral_raw/cerber/*.csv                (Dynamic: 22 columns)
+  → data/behavioral_raw/ryuk/*.csv                  (Dynamic: 22 columns)
+  → data/behavioral_raw/wannacry/*.csv              (Dynamic: 22 columns)
+  → data/behavioral_raw/data/benign_*.csv           (Dynamic: 22 columns)
+
+
+================================================================================
+END OF FEATURE INVENTORY
+================================================================================
