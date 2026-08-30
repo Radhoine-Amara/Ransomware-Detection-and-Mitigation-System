@@ -1,7 +1,8 @@
 # Hybrid Ransomware Detection and Mitigation EDR
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/status-research%20prototype-orange)
+![Status](https://img.shields.io/badge/status-research%20prototype-orange)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 A two-layer **Endpoint Detection and Response (EDR)** research prototype that detects ransomware-like activity by fusing **static memory forensics** with **dynamic behavioral telemetry**, then arbitrates the result through a risk-aware orchestrator before taking any mitigation action.
 
@@ -304,3 +305,9 @@ This project does not require running real ransomware. All ransomware-like behav
 ## Conclusion
 
 Layer 1 provides memory-forensics risk, Layer 2 provides behavioral evidence, and the orchestrator decides the safest response — the system never blindly trusts a single model. This makes it a suitable research prototype for ransomware detection and mitigation.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
